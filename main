@@ -1,0 +1,129 @@
+import json
+import requests
+import xml.etree.ElementTree as ET
+from flask import Flask
+from flask_socketio import SocketIO
+from flask_apscheduler import APScheduler
+import redis
+from concurrent.futures import ThreadPoolExecutor
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'oracle://user:password@host:port/db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+socketio = SocketIO(app, async_mode='gevent')
+scheduler = APScheduler()
+scheduler.init_app(app)
+scheduler.start()
+redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+
+MODULES = {
+    "GetManpower": {
+        "url": "Cache layer address",
+        "request_message": """<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope"><soap12:Body><GetManpower xmlns="KBService" /></soap12:Body></soap12:Envelope>""",
+        "namespace": {"KBService": "KBService"},
+    },
+    "GetHoldWip": {
+        "url": "Cache layer address",
+        "request_message": """<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope"><soap12:Body><GetHoldWip xmlns="KBService" /></soap12:Body></soap12:Envelope>""",
+        "namespace": {"KBService": "KBService"},
+    },
+    # 添加其他模块
+}
+
+def send_soap_request(module_name):
+    module_info = MODULES.get(module_name)
+    if not module_info:
+        print(f"Module '{module_name}' not found.")
+        return None
+    url = module_info["url"]
+    soap_message = module_info["request_message"]
+    response = requests.post(url, data=soap_message, headers={'Content-Type': 'text/xml'})
+    if response.status_code == 200:
+        return response.text
+    else:
+        print(f"Failed to send SOAP request for module '{module_name}'. Status code: {response.status_code}")
+        return None
+
+def parse_manpower_data(xml_data):
+    root = ET.fromstring(xml_data)
+    namespace = {
+        'xs': 'http://www.w3.org/2001/XMLSchema',
+        'msdata': 'urn:schemas-microsoft-com:xml-msdata',
+        'diffgr': 'urn:schemas-microsoft-com:xml-diffgram-v1'
+    }
+    get_manpower_result = root.find('.//diffgr:diffgram', namespace)
+    if get_manpower_result is not None:
+        tables = get_manpower_result.findall('.//Table', namespace)
+        data = []
+        if tables:
+            for table in tables:
+                section = table.find('SECTION').text if table.find('SECTION') is not None else ""
+                leave = table.find('LEAVE').text if table.find('LEAVE') is not None else ""
+                data.append({
+                    'section': section,'leave': leave
+                })
+            return data
+        else:
+            print("No Table in manpower.")
+            return None
+    else:
+        print("GetManpowerResult element not found.")
+        return None
+
+def send_data(module_name):
+    xml_data = send_soap_request(module_name)
+    if xml_data:
+        if module_name == "GetManpower":
+            parsed_data = parse_manpower_data(xml_data)
+        elif module_name == "GetHoldWip":
+            parsed_data = parse_hold_wip_data(xml_data)
+        # 添加其他解析逻辑
+        else:
+            print(f"No parser defined for module '{module_name}'.")
+            parsed_data = None
+    else:
+        parsed_data = []
+    if parsed_data:
+        socketio.emit(f'update_{module_name.lower()}', {'data': parsed_data})
+    else:
+        socketio.emit(f'update_{module_name.lower()}', {'data': []})
+
+def schedule_module_tasks():
+    for module_name in MODULES.keys():
+        scheduler.add_job(id=f"fetch_{module_name}", func=send_data, args=[module_name], trigger='interval', seconds=200, next_run_time='now')
+
+@scheduler.task('interval', id='eqpstatus_task', seconds=200, next_run_time='now')
+def fetch_and_cache_eqpstatus_data():
+    eqpstatus_data = {"data": "eqpstatus data"} 
+    redis_client.set('eqpstatus_data', json.dumps(eqpstatus_data), ex=200)
+    socketio.emit('update_eqpstatus', eqpstatus_data)
+
+@scheduler.task('interval', id='realalarm_task', seconds=200, next_run_time='now')
+def fetch_and_send_realAlarm_data():
+    realAlarm_data = {"data": "realAlarm data"}  
+    socketio.emit('update_realAlarm', realAlarm_data)
+
+@socketio.on('connect')
+def handle_connect():
+    cached_eqpstatus_data = redis_client.get('eqpstatus_data')
+    if cached_eqpstatus_data:
+        socketio.emit('update_eqpstatus', json.loads(cached_eqpstatus_data))
+   
+    for module_name in MODULES:
+        xml_data = send_soap_request(module_name)
+        if xml_data:
+            parsed_data = parse_manpower_data(xml_data) if module_name == "GetManpower" else parse_hold_wip_data(xml_data)
+            socketio.emit(f'update_{module_name.lower()}', {'data': parsed_data})
+        else:
+            socketio.emit(f'update_{module_name.lower()}', {'data': []})
+
+    realAlarm_data = {"data": "realAlarm data"}
+    socketio.emit('update_realAlarm', realAlarm_data)
+
+@app.route('/')
+def index():
+    return 'Server is running'
+
+if __name__ == '__main__':
+    schedule_module_tasks()
+    socketio.run(app, debug=False)
